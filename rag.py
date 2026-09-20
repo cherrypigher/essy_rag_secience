@@ -14,9 +14,11 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
+import chromadb
 import fitz
+from sentence_transformers import SentenceTransformer
 
 
 class RagError(Exception):
@@ -363,7 +365,159 @@ def chunk_paper(
     return chunks
 
 
+def load_embedding_model(model_name: str) -> SentenceTransformer:
+    """加载 Embedding 模型；首次运行需要联网下载，失败时给出可操作提示。"""
+
+    if not model_name.strip():
+        raise RagError("EMBEDDING_MODEL 不能为空，请设置 Embedding 模型名称。")
+    try:
+        return SentenceTransformer(model_name)
+    except Exception as exc:
+        raise RagError(
+            f"加载 Embedding 模型 {model_name} 失败：{exc}。"
+            "首次运行需要联网下载模型，请检查网络连接后重试；"
+            "也可以设置 EMBEDDING_MODEL 使用本地已缓存的模型。"
+        ) from exc
+
+
+def embed_passages(
+    model: SentenceTransformer,
+    chunks: Sequence[ChunkRecord],
+    batch_size: int,
+) -> list[list[float]]:
+    """批量生成归一化的文档向量，输入文本统一添加 E5 的 passage: 前缀。"""
+
+    if not chunks:
+        raise RagError("没有可嵌入的文本块。")
+    if batch_size <= 0:
+        raise RagError(f"EMBEDDING_BATCH_SIZE 必须大于 0，当前为 {batch_size}。")
+
+    texts = [f"passage: {chunk.text}" for chunk in chunks]
+    try:
+        vectors = model.encode(
+            texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+        )
+    except Exception as exc:
+        raise RagError(f"生成文档向量失败：{exc}") from exc
+
+    if hasattr(vectors, "tolist"):
+        vectors = vectors.tolist()
+    else:
+        vectors = [list(vector) for vector in vectors]
+
+    if len(vectors) != len(chunks):
+        raise RagError(f"向量数量 {len(vectors)} 与文本块数量 {len(chunks)} 不一致。")
+    if any(not vector for vector in vectors):
+        raise RagError("Embedding 模型返回了空向量，请重试或更换模型。")
+    return [list(vector) for vector in vectors]
+
+
+def create_chroma_client(chroma_dir: Path) -> chromadb.PersistentClient:
+    """创建本地持久化 ChromaDB 客户端，按需创建目录。"""
+
+    try:
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+        return chromadb.PersistentClient(path=str(chroma_dir))
+    except Exception as exc:
+        raise RagError(f"初始化 ChromaDB 失败（路径 {chroma_dir}）：{exc}") from exc
+
+
+def collection_names(client: Any) -> set[str]:
+    """列出全部 collection 名称，兼容 list_collections 返回字符串或对象。"""
+
+    names: set[str] = set()
+    for item in client.list_collections():
+        names.add(item if isinstance(item, str) else item.name)
+    return names
+
+
+def chunk_metadata(chunk: ChunkRecord) -> dict[str, str | int]:
+    """生成写入 Chroma 的 metadata，只使用字符串和整数字段。"""
+
+    return {
+        "source": chunk.source,
+        "source_path": chunk.source_path,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "chunk_index": chunk.chunk_index,
+        "char_start": chunk.char_start,
+        "char_end": chunk.char_end,
+        "file_sha256": chunk.file_sha256,
+    }
+
+
 def build_index(config: Config) -> None:
+    """全量重建索引：先完成全部提取和向量计算，再替换旧 collection。"""
+
+    pdf_paths = discover_pdfs(config.papers_dir)
+
+    chunks: list[ChunkRecord] = []
+    succeeded = 0
+    skipped = 0
+    failures: list[str] = []
+
+    for pdf_path in pdf_paths:
+        relative_path = pdf_path.relative_to(config.papers_dir).as_posix()
+        try:
+            paper = extract_pdf(pdf_path, config.papers_dir)
+            paper_chunks = chunk_paper(paper, config.chunk_size, config.chunk_overlap)
+        except RagError as exc:
+            skipped += 1
+            failures.append(f"{relative_path}：{exc}")
+            print(f"警告：跳过 {relative_path}：{exc}", file=sys.stderr)
+            continue
+        chunks.extend(paper_chunks)
+        succeeded += 1
+
+    if succeeded == 0:
+        detail = "\n".join(f"- {failure}" for failure in failures)
+        raise RagError(f"所有 PDF 都提取失败，索引未更新：\n{detail}")
+    if not chunks:
+        raise RagError("没有生成任何文本块，索引未更新。")
+
+    model = load_embedding_model(config.embedding_model)
+    embeddings = embed_passages(model, chunks, config.embedding_batch_size)
+
+    client = create_chroma_client(config.chroma_dir)
+    if config.collection_name in collection_names(client):
+        client.delete_collection(config.collection_name)
+    collection = client.create_collection(
+        name=config.collection_name,
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_model": config.embedding_model,
+            "chunk_size": config.chunk_size,
+            "chunk_overlap": config.chunk_overlap,
+            "schema_version": 1,
+        },
+    )
+
+    for offset in range(0, len(chunks), config.chroma_write_batch_size):
+        batch = chunks[offset : offset + config.chroma_write_batch_size]
+        batch_embeddings = embeddings[offset : offset + config.chroma_write_batch_size]
+        collection.upsert(
+            ids=[chunk.id for chunk in batch],
+            documents=[chunk.text for chunk in batch],
+            embeddings=[list(vector) for vector in batch_embeddings],
+            metadatas=[chunk_metadata(chunk) for chunk in batch],
+        )
+
+    stored = collection.count()
+    if stored != len(chunks):
+        raise RagError(f"写入校验失败：数据库中有 {stored} 条记录，预期 {len(chunks)} 条。")
+
+    print("索引完成")
+    print(f"- 成功论文：{succeeded}")
+    print(f"- 跳过论文：{skipped}")
+    print(f"- 文本块：{stored}")
+    print(f"- ChromaDB：{config.chroma_dir}")
+    print(f"- Collection：{config.collection_name}")
+
+
+def answer_question(question: str, config: Config) -> None:
     """建立或重建 ChromaDB 索引（后续步骤实现）。"""
 
     raise RagError("索引功能尚未实现，请先完成后续实施步骤。")
