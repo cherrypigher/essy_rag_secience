@@ -1,0 +1,20 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local RAG data and model caches
+chroma_db/
+.cache/
+
+# Local environment and editor files
+.env
+.idea/
+.vscode/
+*.swp
+
+# Operating-system files
+.DS_Store
+Thumbs.db
