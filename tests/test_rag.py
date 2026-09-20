@@ -739,6 +739,44 @@ class TestBuildOllamaMessages:
             rag.build_ollama_messages("问题", [])
 
 
+class TestLocalRequestProxies:
+    def test_loopback_ipv4_bypasses_proxy(self) -> None:
+        assert rag.local_request_proxies("http://127.0.0.1:11434") == {
+            "http": None,
+            "https": None,
+        }
+
+    def test_loopback_ipv6_and_localhost_bypass_proxy(self) -> None:
+        assert rag.local_request_proxies("http://[::1]:11434") == {
+            "http": None,
+            "https": None,
+        }
+        assert rag.local_request_proxies("http://localhost:11434") == {
+            "http": None,
+            "https": None,
+        }
+
+    def test_remote_address_keeps_environment_proxy(self) -> None:
+        assert rag.local_request_proxies("http://gpu.example.com:11434") is None
+        assert rag.local_request_proxies("http://192.168.1.10:11434") is None
+
+    def test_missing_host_keeps_environment_proxy(self) -> None:
+        assert rag.local_request_proxies("not-a-url") is None
+
+    def test_call_ollama_bypasses_proxy_for_loopback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_post(url: str, **kwargs: object) -> FakeResponse:
+            captured["kwargs"] = kwargs
+            return FakeResponse(json_data={"message": {"content": "答案"}})
+
+        monkeypatch.setattr(rag.requests, "post", fake_post)
+        rag.call_ollama([{"role": "user", "content": "hi"}], make_config(Path(".")))
+        assert captured["kwargs"]["proxies"] == {"http": None, "https": None}  # type: ignore[index]
+
+
 class TestCallOllama:
     def test_posts_expected_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured: dict[str, object] = {}

@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 import chromadb
 import fitz
@@ -700,6 +702,26 @@ def _ollama_error_detail(response: requests.Response) -> str:
     return f"未提供错误详情（HTTP {response.status_code}）"
 
 
+def local_request_proxies(base_url: str) -> dict[str, None] | None:
+    """本机地址显式绕过环境代理，避免代理把回环请求拦截成 502。
+
+    某些环境的 ``no_proxy`` 写成 ``127.*``，Python 的代理匹配不会认为
+    ``127.0.0.1`` 命中该规则，于是本机 Ollama 请求被转发给代理。
+    只有回环地址才绕过代理；远程 Ollama 地址仍按环境变量走代理。
+    """
+
+    host = (urlsplit(base_url).hostname or "").strip("[]").lower()
+    if host == "localhost":
+        return {"http": None, "https": None}
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if address.is_loopback:
+        return {"http": None, "https": None}
+    return None
+
+
 def call_ollama(
     messages: Sequence[dict[str, str]],
     config: Config,
@@ -719,6 +741,7 @@ def call_ollama(
             url,
             json=payload,
             timeout=(config.ollama_connect_timeout, config.ollama_read_timeout),
+            proxies=local_request_proxies(config.ollama_base_url),
         )
     except requests.ConnectionError as exc:
         raise RagError(

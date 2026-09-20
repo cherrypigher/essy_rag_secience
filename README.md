@@ -116,6 +116,7 @@ python -m pytest -q
 
 - **PDF 没有文本层**：首版不做 OCR，扫描件会得到空文本并被跳过。请使用带文本层的 PDF。
 - **Ollama 连接失败**：运行 `ollama serve` 或检查服务状态、端口和 `OLLAMA_BASE_URL`。
+- **报错 HTTP 502 或代理相关错误**：`127.0.0.1`、`localhost` 等本机地址已自动绕过环境代理；如果 `OLLAMA_BASE_URL` 指向远程地址，请确认本机 `HTTP_PROXY`/`HTTPS_PROXY` 能访问该地址。
 - **模型不存在**：运行 `ollama pull deepseek-r1:7b`。
 - **Embedding 首次加载慢**：首次运行会下载模型并写入本地缓存，之后启动会快很多。
 - **修改论文后结果没变化**：重新运行 `python rag.py index` 重建索引。
