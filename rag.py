@@ -8,11 +8,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+import fitz
 
 
 class RagError(Exception):
@@ -169,6 +173,194 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+_HASH_BLOCK_SIZE = 1024 * 1024
+_PAGE_SEPARATOR = "\n\n"
+_INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
+_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+def sha256_file(path: Path) -> str:
+    """以 1 MiB 为单位流式计算文件 SHA-256，返回 64 位小写十六进制。"""
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(_HASH_BLOCK_SIZE), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise RagError(f"无法读取文件 {path}：{exc}") from exc
+    return digest.hexdigest()
+
+
+def discover_pdfs(papers_dir: Path) -> list[Path]:
+    """递归查找 papers_dir 下的 PDF，按相对路径 casefold 排序保证结果稳定。"""
+
+    if not papers_dir.exists():
+        raise RagError(
+            f"论文目录 {papers_dir} 不存在，请创建该目录并放入 PDF 文件，"
+            "或通过 PAPERS_DIR 指定其他目录。"
+        )
+    if not papers_dir.is_dir():
+        raise RagError(f"路径 {papers_dir} 不是目录，请通过 PAPERS_DIR 指向存放 PDF 的目录。")
+
+    pdf_paths = [
+        path
+        for path in papers_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    ]
+    if not pdf_paths:
+        raise RagError(f"在 {papers_dir} 下没有找到 PDF 文件，请先放入论文。")
+
+    pdf_paths.sort(
+        key=lambda path: (
+            path.relative_to(papers_dir).as_posix().casefold(),
+            path.relative_to(papers_dir).as_posix(),
+        )
+    )
+    return pdf_paths
+
+
+def normalize_page_text(text: str) -> str:
+    """规范化单页 PDF 文本：压缩行内空白，但保留段落换行边界。"""
+
+    cleaned = text.replace("\x00", " ")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = [_INLINE_WHITESPACE_RE.sub(" ", line).strip() for line in cleaned.split("\n")]
+    cleaned = "\n".join(lines)
+    cleaned = _BLANK_LINES_RE.sub(_PAGE_SEPARATOR, cleaned)
+    return cleaned.strip()
+
+
+def extract_pdf(path: Path, papers_dir: Path) -> ExtractedPaper:
+    """逐页提取 PDF 文本，并记录每页在规范化全文中的字符区间。"""
+
+    file_sha256 = sha256_file(path)
+    relative_path = path.relative_to(papers_dir).as_posix()
+
+    document = None
+    try:
+        document = fitz.open(path)
+        if document.needs_pass:
+            raise RagError(f"PDF {relative_path} 已加密，请先移除密码保护后重新索引。")
+
+        parts: list[str] = []
+        page_spans: list[PageSpan] = []
+        cursor = 0
+
+        for page_number in range(1, document.page_count + 1):
+            page_text = normalize_page_text(document.load_page(page_number - 1).get_text("text", sort=True))
+            if not page_text:
+                continue
+            if parts:
+                parts.append(_PAGE_SEPARATOR)
+                cursor += len(_PAGE_SEPARATOR)
+            parts.append(page_text)
+            start = cursor
+            cursor += len(page_text)
+            page_spans.append(PageSpan(page_number=page_number, start=start, end=cursor))
+
+        text = "".join(parts)
+        if not text:
+            raise RagError(
+                f"PDF {relative_path} 没有可提取的文本层，可能是扫描版论文；"
+                "首版不支持 OCR，请提供带文本层的 PDF。"
+            )
+    except RagError:
+        raise
+    except Exception as exc:
+        raise RagError(f"提取 PDF {relative_path} 文本失败：{exc}") from exc
+    finally:
+        if document is not None:
+            document.close()
+
+    return ExtractedPaper(
+        path=path,
+        relative_path=relative_path,
+        file_sha256=file_sha256,
+        text=text,
+        page_spans=tuple(page_spans),
+    )
+
+
+def pages_for_range(
+    page_spans: Sequence[PageSpan],
+    start: int,
+    end: int,
+) -> tuple[int, int]:
+    """返回字符区间 [start, end) 覆盖的起止页码，无命中时抛错而不是伪造页码。"""
+
+    matched = [
+        span.page_number for span in page_spans if span.start < end and span.end > start
+    ]
+    if not matched:
+        raise RagError(f"字符区间 [{start}, {end}) 没有对应到任何页，无法确定页码范围。")
+    return matched[0], matched[-1]
+
+
+def chunk_paper(
+    paper: ExtractedPaper,
+    chunk_size: int,
+    overlap: int,
+) -> list[ChunkRecord]:
+    """按固定字符滑窗切块：chunk_size=500、overlap=50 时步长为 450。
+
+    与朴素的 ``range(0, len(text), step)`` 相比，这里额外跳过“不产生任何新内容”的
+    尾部窗口：例如 499 字符文本在 500/50 下，第二个窗口 [450, 499) 完全被第一个
+    窗口 [0, 499) 覆盖，保留它只会得到一段纯重复文本。因此短于 500 字符的非空
+    文本只产生一块，而 1000 字符仍然严格得到起点 0/450/900 的三块，相邻完整块
+    的重叠字符数仍恰好是 overlap。
+    """
+
+    if chunk_size <= 0:
+        raise RagError(f"chunk_size 必须大于 0，当前为 {chunk_size}。")
+    if not 0 <= overlap < chunk_size:
+        raise RagError(
+            f"overlap 必须满足 0 <= overlap < chunk_size（当前 chunk_size 为 {chunk_size}），"
+            f"当前 overlap 为 {overlap}。"
+        )
+
+    step = chunk_size - overlap
+    chunks: list[ChunkRecord] = []
+    covered_end: int | None = None
+
+    for start in range(0, len(paper.text), step):
+        end = min(start + chunk_size, len(paper.text))
+        chunk_text = paper.text[start:end]
+        if not chunk_text.strip():
+            continue
+        if covered_end is not None and end <= covered_end:
+            continue
+
+        page_start, page_end = pages_for_range(paper.page_spans, start, end)
+        chunk_index = len(chunks)
+        raw_id = (
+            f"{paper.relative_path}\0{paper.file_sha256}\0"
+            f"{chunk_index}\0{start}\0{end}"
+        )
+        chunks.append(
+            ChunkRecord(
+                id=hashlib.sha256(raw_id.encode("utf-8")).hexdigest(),
+                text=chunk_text,
+                source=paper.path.name,
+                source_path=paper.relative_path,
+                page_start=page_start,
+                page_end=page_end,
+                chunk_index=chunk_index,
+                char_start=start,
+                char_end=end,
+                file_sha256=paper.file_sha256,
+            )
+        )
+        covered_end = end
+
+    if paper.text.strip() and not chunks:
+        raise RagError(
+            f"论文 {paper.relative_path} 有文本但没有产生任何文本块，请检查切块参数。"
+        )
+    return chunks
 
 
 def build_index(config: Config) -> None:
