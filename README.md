@@ -2,7 +2,7 @@
 
 ## 1. 项目简介
 
-一个本地运行的极简科研论文问答命令行工具：递归读取 `papers/` 目录下的 PDF，提取文本并按 500 字符切块，使用轻量 Embedding 模型生成向量并持久化到 ChromaDB；提问时用同一个 Embedding 模型编码问题，检索最相关的 3 个文本块，交给本地 Ollama 的 `deepseek-r1:7b` 生成回答，并输出引用论文文件名。首版不包含 Web 界面、API 服务、OCR、多轮对话记忆、BM25 或 reranker。
+一个本地运行的极简科研论文问答工具：既提供命令行入口，也提供一个只监听本机的网页问答页面。递归读取 `papers/` 目录下的 PDF，提取文本并按 500 字符切块，使用轻量 Embedding 模型生成向量并持久化到 ChromaDB；提问时用同一个 Embedding 模型编码问题，检索最相关的 3 个文本块，交给本地 Ollama 的 `deepseek-r1:7b` 生成回答，并输出引用论文文件名。网页与命令行复用同一套问答流程（Top-3 检索、Ollama 生成、去重引用），不会另有一套逻辑。暂不提供 OCR、多轮对话记忆、BM25 或 reranker。
 
 ## 2. 工作流程
 
@@ -12,6 +12,8 @@ PDF -> 文本 -> 500/50 切块 -> E5 Embedding -> ChromaDB
 ```
 
 索引阶段把向量、原文和来源元数据（论文文件名、相对路径、页码范围、块序号、文件 SHA-256）写入 ChromaDB；问答阶段只使用检索到的片段作为证据，引用论文名取自 Chroma metadata，不依赖模型自行生成。
+
+命令行（`python rag.py ask`）和网页（`python web_app.py`）调用的是同一个 `generate_answer()`，所以两边的检索范围、提示词和引用去重结果完全一致，网页不会另有一套问答逻辑。
 
 ## 3. 环境要求
 
@@ -76,7 +78,36 @@ python rag.py ask
 
 输出始终包含「回答」和「引用论文」两部分；如果检索片段证据不足，回答会明确说明无法确定，而不是编造结论。
 
-## 8. 配置
+## 8. 启动网页问答
+
+网页服务只监听本机 `127.0.0.1:8000`，面向单用户使用，不是公网生产服务。启动前必须先按第 6 节建立索引；网页不负责上传 PDF，也不负责重建索引。
+
+```bash
+.venv/bin/python rag.py index
+OLLAMA_BASE_URL=http://127.0.0.1:11436 .venv/bin/python web_app.py
+```
+
+然后在浏览器打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+页面提供一个问题输入框和「提交问题」按钮，回答下方列出从 Chroma metadata 去重后的引用论文文件名；索引、Embedding 模型或 Ollama 不可用时，页面显示简洁的中文错误，不会显示 traceback。
+
+说明：
+
+- Ollama 默认地址是 `http://127.0.0.1:11434`。上面的 `11436` 只是当前机器的示例；如果你的 Ollama 就在默认端口，直接运行 `.venv/bin/python web_app.py` 即可。
+- 停止网页服务：在运行 `web_app.py` 的终端按 `Ctrl+C`。
+- 如果当前环境没有 `.venv/bin/activate`，可以像下面这样直接使用虚拟环境的解释器：
+
+  ```bash
+  source .venv/bin/activate
+  # 如果 activate 不存在：
+  .venv/bin/python web_app.py
+  ```
+
+## 9. 配置
 
 默认值集中在 `rag.py` 的配置对象中，可用同名环境变量覆盖，不需要改代码：
 
@@ -106,7 +137,7 @@ python rag.py ask
 OLLAMA_BASE_URL=http://127.0.0.1:11436 python rag.py ask "这些论文主要研究了什么问题？"
 ```
 
-## 9. 测试
+## 10. 测试
 
 ```bash
 python -m pytest -q
@@ -114,7 +145,7 @@ python -m pytest -q
 
 单元测试不访问真实网络、不下载真实 Embedding 模型，Ollama 调用使用 mock，测试数据库使用临时目录，也不会修改 `papers/` 中的 PDF。
 
-## 10. 常见问题
+## 11. 常见问题
 
 - **PDF 没有文本层**：首版不做 OCR，扫描件会得到空文本并被跳过。请使用带文本层的 PDF。
 - **Ollama 连接失败**：运行 `ollama serve` 或检查服务状态、端口和 `OLLAMA_BASE_URL`。
@@ -122,4 +153,7 @@ python -m pytest -q
 - **模型不存在**：运行 `ollama pull deepseek-r1:7b`。
 - **Embedding 首次加载慢**：首次运行会下载模型并写入本地缓存，之后启动会快很多。
 - **修改论文后结果没变化**：重新运行 `python rag.py index` 重建索引。
+- **网页启动时报「不存在 collection」**：说明该 `CHROMA_DIR` 下还没有索引，先运行 `.venv/bin/python rag.py index` 再启动 `web_app.py`。
+- **网页提交问题后显示 Ollama 错误**：确认 `ollama serve` 正在运行，并检查网页启动时的 `OLLAMA_BASE_URL` 是否与 Ollama 实际端口一致。
+- **浏览器出现其他电脑无法访问**：网页只监听 `127.0.0.1:8000`，这是有意的本机限制，不是配置错误。
 - **CPU 运行较慢**：`multilingual-e5-small` 可以在 CPU 上运行，但首次索引和提问仍需要等待时间。
