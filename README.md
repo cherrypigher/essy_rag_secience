@@ -98,6 +98,8 @@ python rag.py ask
 
 整数环境变量必须为正整数；`CHUNK_OVERLAP` 可以为 0，但必须小于 `CHUNK_SIZE`，否则启动时报错。
 
+`COLLECTION_NAME`、`EMBEDDING_MODEL`、`OLLAMA_MODEL` 这三个必填名称不能显式设置为空字符串或纯空白，否则启动时报错并指出变量名；取消该环境变量即可恢复默认值。`PAPERS_DIR`、`CHROMA_DIR`、`OLLAMA_BASE_URL` 置空则视为未设置，沿用默认值。
+
 如果 Ollama 监听在非默认端口（例如 `127.0.0.1:11436`），用环境变量指定，不要修改代码：
 
 ```bash

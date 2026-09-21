@@ -12,6 +12,7 @@ import chromadb
 import fitz
 import pytest
 import requests
+from requests.utils import get_environ_proxies, select_proxy
 
 import rag
 from rag import (
@@ -324,6 +325,93 @@ def make_papers_dir(tmp_path: Path, names: list[str], text: str = LONG_TEXT) -> 
     for name in names:
         write_pdf(papers / name, [text])
     return papers
+
+
+ENV_NAMES = (
+    "PAPERS_DIR",
+    "CHROMA_DIR",
+    "COLLECTION_NAME",
+    "EMBEDDING_MODEL",
+    "OLLAMA_BASE_URL",
+    "OLLAMA_MODEL",
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP",
+    "TOP_K",
+    "EMBEDDING_BATCH_SIZE",
+    "CHROMA_WRITE_BATCH_SIZE",
+    "OLLAMA_CONNECT_TIMEOUT",
+    "OLLAMA_READ_TIMEOUT",
+)
+
+
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """清空所有 rag 配置环境变量，避免测试机上的变量影响断言。"""
+
+    for name in ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
+class TestConfigFromEnv:
+    def test_defaults_without_environment(self, clean_env: None) -> None:
+        config = Config.from_env()
+        assert config.papers_dir == Path("papers")
+        assert config.chroma_dir == Path("chroma_db")
+        assert config.collection_name == "science_papers"
+        assert config.embedding_model == "intfloat/multilingual-e5-small"
+        assert config.ollama_base_url == "http://127.0.0.1:11434"
+        assert config.ollama_model == "deepseek-r1:7b"
+        assert (config.chunk_size, config.chunk_overlap) == (500, 50)
+        assert config.top_k == 3
+        assert config.ollama_connect_timeout == 5
+        assert config.ollama_read_timeout == 300
+
+    def test_environment_overrides_are_stripped(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COLLECTION_NAME", "  my_papers  ")
+        monkeypatch.setenv("OLLAMA_BASE_URL", " http://127.0.0.1:11436/ ")
+        monkeypatch.setenv("OLLAMA_MODEL", " qwen2.5:7b ")
+        monkeypatch.setenv("EMBEDDING_MODEL", " intfloat/multilingual-e5-base ")
+        config = Config.from_env()
+        assert config.collection_name == "my_papers"
+        assert config.ollama_base_url == "http://127.0.0.1:11436"
+        assert config.ollama_model == "qwen2.5:7b"
+        assert config.embedding_model == "intfloat/multilingual-e5-base"
+
+    @pytest.mark.parametrize("name", ["COLLECTION_NAME", "EMBEDDING_MODEL", "OLLAMA_MODEL"])
+    @pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+    def test_blank_required_name_is_rejected(
+        self,
+        clean_env: None,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+    ) -> None:
+        """必填名称显式置空必须报错，不能悄悄回落到默认值。"""
+
+        monkeypatch.setenv(name, value)
+        with pytest.raises(RagError) as excinfo:
+            Config.from_env()
+        assert name in str(excinfo.value)
+        assert "空值" in str(excinfo.value)
+
+    def test_unset_required_name_uses_default(self, clean_env: None) -> None:
+        config = Config.from_env()
+        assert config.collection_name == "science_papers"
+        assert config.embedding_model == "intfloat/multilingual-e5-small"
+        assert config.ollama_model == "deepseek-r1:7b"
+
+    def test_blank_optional_paths_fall_back_to_default(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PAPERS_DIR / CHROMA_DIR 置空视为未设置，沿用默认值。"""
+
+        monkeypatch.setenv("PAPERS_DIR", "  ")
+        monkeypatch.setenv("CHROMA_DIR", "")
+        config = Config.from_env()
+        assert config.papers_dir == Path("papers")
+        assert config.chroma_dir == Path("chroma_db")
 
 
 class FakeEmbeddingModel:
@@ -744,17 +832,13 @@ class TestLocalRequestProxies:
         assert rag.local_request_proxies("http://127.0.0.1:11434") == {
             "http": None,
             "https": None,
+            "all": None,
         }
 
     def test_loopback_ipv6_and_localhost_bypass_proxy(self) -> None:
-        assert rag.local_request_proxies("http://[::1]:11434") == {
-            "http": None,
-            "https": None,
-        }
-        assert rag.local_request_proxies("http://localhost:11434") == {
-            "http": None,
-            "https": None,
-        }
+        expected = {"http": None, "https": None, "all": None}
+        assert rag.local_request_proxies("http://[::1]:11434") == expected
+        assert rag.local_request_proxies("http://localhost:11434") == expected
 
     def test_remote_address_keeps_environment_proxy(self) -> None:
         assert rag.local_request_proxies("http://gpu.example.com:11434") is None
@@ -774,7 +858,33 @@ class TestLocalRequestProxies:
 
         monkeypatch.setattr(rag.requests, "post", fake_post)
         rag.call_ollama([{"role": "user", "content": "hi"}], make_config(Path(".")))
-        assert captured["kwargs"]["proxies"] == {"http": None, "https": None}  # type: ignore[index]
+        assert captured["kwargs"]["proxies"] == {  # type: ignore[index]
+            "http": None,
+            "https": None,
+            "all": None,
+        }
+
+    def test_loopback_neutralizes_every_environment_proxy_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """环境可能通过 ALL_PROXY 提供 ``all`` 键，必须一并显式置空。"""
+
+        monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:57777")
+        monkeypatch.setenv("NO_PROXY", "127.*,localhost")
+        for url in ("http://127.0.0.1:11436/api/chat", "https://127.0.0.1:11436"):
+            env_proxies = get_environ_proxies(url, no_proxy=None)
+            assert "all" in env_proxies  # 环境确实提供了会被 all 键命中的代理
+            proxies = rag.local_request_proxies(url)
+            assert proxies is not None
+            for key, value in env_proxies.items():
+                if key == "no":  # no_proxy 本身不是代理地址
+                    continue
+                assert proxies.get(key, "MISSING") is None
+            # 按 requests 的合并规则套用后，最终选中的代理必须是 None（直连）
+            merged = dict(proxies)
+            for key, value in env_proxies.items():
+                merged.setdefault(key, value)
+            assert select_proxy(url, merged) is None
 
 
 class TestCallOllama:

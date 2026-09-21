@@ -62,10 +62,18 @@ class Config:
         return cls(
             papers_dir=Path(_env_str("PAPERS_DIR", "papers")),
             chroma_dir=Path(_env_str("CHROMA_DIR", "chroma_db")),
-            collection_name=_env_str("COLLECTION_NAME", "science_papers"),
-            embedding_model=_env_str("EMBEDDING_MODEL", "intfloat/multilingual-e5-small"),
+            collection_name=_env_str(
+                "COLLECTION_NAME", "science_papers", allow_blank=False
+            ),
+            embedding_model=_env_str(
+                "EMBEDDING_MODEL",
+                "intfloat/multilingual-e5-small",
+                allow_blank=False,
+            ),
             ollama_base_url=base_url,
-            ollama_model=_env_str("OLLAMA_MODEL", "deepseek-r1:7b"),
+            ollama_model=_env_str(
+                "OLLAMA_MODEL", "deepseek-r1:7b", allow_blank=False
+            ),
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             top_k=_env_int("TOP_K", 3, minimum=1),
@@ -126,12 +134,20 @@ class SearchHit:
     distance: float
 
 
-def _env_str(name: str, default: str) -> str:
-    """读取字符串环境变量，去除首尾空白，空值视为未设置。"""
+def _env_str(name: str, default: str, *, allow_blank: bool = True) -> str:
+    """读取字符串环境变量，去除首尾空白；空值是否合法由 allow_blank 决定。
+
+    ``allow_blank=False`` 用于必填名称：显式设置空串或纯空白属于配置错误，
+    直接报错并指出变量名，而不是悄悄回落到默认值。
+    """
 
     raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+    if raw is None:
         return default
+    if not raw.strip():
+        if allow_blank:
+            return default
+        raise RagError(f"环境变量 {name} 被设置为空值，请填写具体取值或取消该环境变量。")
     return raw.strip()
 
 
@@ -520,12 +536,6 @@ def build_index(config: Config) -> None:
     print(f"- Collection：{config.collection_name}")
 
 
-def answer_question(question: str, config: Config) -> None:
-    """建立或重建 ChromaDB 索引（后续步骤实现）。"""
-
-    raise RagError("索引功能尚未实现，请先完成后续实施步骤。")
-
-
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -707,18 +717,22 @@ def local_request_proxies(base_url: str) -> dict[str, None] | None:
 
     某些环境的 ``no_proxy`` 写成 ``127.*``，Python 的代理匹配不会认为
     ``127.0.0.1`` 命中该规则，于是本机 Ollama 请求被转发给代理。
+    ``http``/``https``/``all`` 三个键都显式置空：requests 的
+    ``select_proxy`` 按「scheme + ``://`` + host、scheme、``all://`` + host、
+    ``all``」的顺序查找，只填 scheme 键时仍可能被 ``ALL_PROXY`` 填充的
+    ``all`` 命中，因此三个键一并显式置空才是真正绕过。
     只有回环地址才绕过代理；远程 Ollama 地址仍按环境变量走代理。
     """
 
     host = (urlsplit(base_url).hostname or "").strip("[]").lower()
     if host == "localhost":
-        return {"http": None, "https": None}
+        return {"http": None, "https": None, "all": None}
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return None
     if address.is_loopback:
-        return {"http": None, "https": None}
+        return {"http": None, "https": None, "all": None}
     return None
 
 
