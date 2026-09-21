@@ -16,11 +16,13 @@ from requests.utils import get_environ_proxies, select_proxy
 
 import rag
 from rag import (
+    AnswerResult,
     ChunkRecord,
     Config,
     ExtractedPaper,
     PageSpan,
     RagError,
+    SearchHit,
     chunk_paper,
     discover_pdfs,
     extract_pdf,
@@ -1030,6 +1032,132 @@ class TestCitedSources:
         assert rag.cited_sources(hits) == ["论文1.pdf"]
 
 
+class TestGenerateAnswer:
+    """命令行与网页共用的纯问答编排函数，不打印、不创建资源。"""
+
+    def _hits_with_duplicate_paper(self) -> list[SearchHit]:
+        """构造 Top-3 命中：前两条来自同一篇论文，第三条来自另一篇。"""
+
+        rows = make_rows(3)
+        for row in rows[:2]:
+            row["metadata"]["source"] = "论文1.pdf"  # type: ignore[index]
+            row["metadata"]["source_path"] = "论文1.pdf"  # type: ignore[index]
+        rows[2]["metadata"]["source"] = "论文4.pdf"  # type: ignore[index]
+        rows[2]["metadata"]["source_path"] = "论文4.pdf"  # type: ignore[index]
+        return rag.retrieve(FakeCollection(3, rows), [0.1], 3)
+
+    def _patch_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch, hits: list[SearchHit]
+    ) -> dict[str, object]:
+        """只替换 Embedding、检索和 Ollama，保留真实的提示词组装和清理逻辑。"""
+
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            rag, "embed_query", lambda model, question: [0.1, 0.2, 0.3, 0.4]
+        )
+        monkeypatch.setattr(
+            rag,
+            "retrieve",
+            lambda collection, embedding, top_k: captured.update(
+                {"top_k": top_k}
+            )
+            or hits,
+        )
+        monkeypatch.setattr(
+            rag,
+            "call_ollama",
+            lambda messages, config: captured.update({"messages": messages})
+            or "<think>内部推理过程</think>根据片段可以确定结论 [1][2]。",
+        )
+        return captured
+
+    def test_returns_answer_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(tmp_path)
+        self._patch_pipeline(monkeypatch, self._hits_with_duplicate_paper())
+
+        result = rag.generate_answer(
+            "这些论文主要研究了什么问题？",
+            config,
+            FakeEmbeddingModel(),
+            FakeCollection(3, []),
+        )
+
+        assert isinstance(result, AnswerResult)
+        assert result.answer == "根据片段可以确定结论 [1][2]。"
+        assert result.sources == ("论文1.pdf", "论文4.pdf")
+
+    def test_uses_configured_top_k(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(tmp_path, top_k=3)
+        captured = self._patch_pipeline(monkeypatch, self._hits_with_duplicate_paper())
+
+        rag.generate_answer("问题", config, FakeEmbeddingModel(), FakeCollection(3, []))
+
+        assert captured["top_k"] == 3
+
+    def test_strips_question_before_building_prompt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(tmp_path)
+        captured = self._patch_pipeline(monkeypatch, self._hits_with_duplicate_paper())
+
+        rag.generate_answer(
+            "  这些论文研究了什么问题？\n", config, FakeEmbeddingModel(), FakeCollection(3, [])
+        )
+
+        messages = captured["messages"]  # type: ignore[assignment]
+        assert "用户问题：\n这些论文研究了什么问题？" in messages[1]["content"]  # type: ignore[index]
+
+    def test_blank_question_raises_before_touching_services(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(tmp_path)
+
+        def forbidden(*args: object, **kwargs: object):
+            raise AssertionError("不应在问题为空时调用 Embedding、检索或 Ollama")
+
+        monkeypatch.setattr(rag, "embed_query", forbidden)
+        monkeypatch.setattr(rag, "retrieve", forbidden)
+        monkeypatch.setattr(rag, "call_ollama", forbidden)
+
+        with pytest.raises(RagError, match="问题不能为空"):
+            rag.generate_answer(
+                "   \n  ", config, FakeEmbeddingModel(), FakeCollection(3, [])
+            )
+
+    def test_does_not_print_terminal_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        config = make_config(tmp_path)
+        self._patch_pipeline(monkeypatch, self._hits_with_duplicate_paper())
+
+        rag.generate_answer("问题", config, FakeEmbeddingModel(), FakeCollection(3, []))
+
+        assert capsys.readouterr().out == ""
+
+    def test_propagates_ollama_error_without_swallowing_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = make_config(tmp_path)
+        hits = self._hits_with_duplicate_paper()
+        monkeypatch.setattr(rag, "embed_query", lambda model, question: [0.1])
+        monkeypatch.setattr(rag, "retrieve", lambda collection, embedding, top_k: hits)
+
+        def failing_ollama(messages: object, config: object) -> str:
+            raise RagError("无法连接 Ollama 服务，请确认已运行 ollama serve。")
+
+        monkeypatch.setattr(rag, "call_ollama", failing_ollama)
+
+        with pytest.raises(RagError, match="ollama serve"):
+            rag.generate_answer("问题", config, FakeEmbeddingModel(), FakeCollection(3, []))
+
+
 class TestAnswerQuestion:
     def _prepare(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
         papers = make_papers_dir(tmp_path, ["论文1.pdf", "论文4.pdf"])
@@ -1071,6 +1199,36 @@ class TestAnswerQuestion:
         assert "引用论文：" in output
         assert output.count("- 论文1.pdf") == 1
         assert "- 论文4.pdf" in output
+
+    def test_delegates_to_shared_generate_answer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CLI 必须与网页共用同一个问答编排函数，而不是另有一套逻辑。"""
+
+        config = make_config(tmp_path)
+        captured: dict[str, object] = {}
+
+        def fake_generate_answer(
+            question: str,
+            config: Config,
+            model: object,
+            collection: object,
+        ) -> AnswerResult:
+            captured["question"] = question
+            return AnswerResult(answer="共用函数的回答。", sources=("论文1.pdf",))
+
+        monkeypatch.setattr(rag, "generate_answer", fake_generate_answer)
+        monkeypatch.setattr(
+            rag, "create_chroma_client", lambda chroma_dir: FakeClient(None, set())
+        )
+        monkeypatch.setattr(rag, "get_index_collection", lambda client, config: None)
+        monkeypatch.setattr(
+            rag, "load_embedding_model", lambda name: FakeEmbeddingModel()
+        )
+
+        rag.answer_question("  共用问题  ", config)
+
+        assert captured["question"] == "共用问题"
 
     def test_blank_question_raises_without_touching_services(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

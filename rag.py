@@ -134,6 +134,14 @@ class SearchHit:
     distance: float
 
 
+@dataclass(frozen=True)
+class AnswerResult:
+    """一次问答的最终结果，供命令行和网页共用。"""
+
+    answer: str
+    sources: tuple[str, ...]
+
+
 def _env_str(name: str, default: str, *, allow_blank: bool = True) -> str:
     """读取字符串环境变量，去除首尾空白；空值是否合法由 allow_blank 决定。
 
@@ -814,6 +822,29 @@ def cited_sources(hits: Sequence[SearchHit]) -> list[str]:
     return sources
 
 
+def generate_answer(
+    question: str,
+    config: Config,
+    model: SentenceTransformer,
+    collection: Any,
+) -> AnswerResult:
+    """纯问答编排：检索 Top-k、调用 Ollama，返回回答与去重引用，不打印输出。
+
+    命令行和网页复用同一函数，确保两边的检索、提示词和生成逻辑完全一致；
+    资源（Embedding 模型、collection）由调用方创建并传入，本函数不负责加载。
+    """
+
+    cleaned_question = question.strip()
+    if not cleaned_question:
+        raise RagError("问题不能为空，请输入要回答的问题。")
+
+    query_embedding = embed_query(model, cleaned_question)
+    hits = retrieve(collection, query_embedding, config.top_k)
+    messages = build_ollama_messages(cleaned_question, hits)
+    answer = clean_model_answer(call_ollama(messages, config))
+    return AnswerResult(answer=answer, sources=tuple(cited_sources(hits)))
+
+
 def answer_question(question: str, config: Config) -> None:
     """回答问题：检索 Top-3 片段，调用 Ollama，输出回答和引用论文。"""
 
@@ -825,17 +856,13 @@ def answer_question(question: str, config: Config) -> None:
     collection = get_index_collection(client, config)
 
     model = load_embedding_model(config.embedding_model)
-    query_embedding = embed_query(model, cleaned_question)
-    hits = retrieve(collection, query_embedding, config.top_k)
-
-    messages = build_ollama_messages(cleaned_question, hits)
-    answer = clean_model_answer(call_ollama(messages, config))
+    result = generate_answer(cleaned_question, config, model, collection)
 
     print("回答：")
-    print(answer)
+    print(result.answer)
     print()
     print("引用论文：")
-    for source in cited_sources(hits):
+    for source in result.sources:
         print(f"- {source}")
 
 
