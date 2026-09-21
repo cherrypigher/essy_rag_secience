@@ -1,0 +1,121 @@
+/* 本地网页问答的基础样式：只保证可用与可读，不追求设计系统。 */
+
+body {
+  margin: 0;
+  padding: 24px 16px;
+  background: #f6f7f9;
+  color: #1f2328;
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC",
+    "Microsoft YaHei", sans-serif;
+  line-height: 1.6;
+}
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 8px;
+}
+
+h2 {
+  font-size: 1.1rem;
+  margin: 0 0 8px;
+}
+
+.hint {
+  margin: 0 0 20px;
+  color: #57606a;
+  font-size: 0.95rem;
+}
+
+form {
+  display: block;
+  margin-bottom: 20px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 96px;
+  padding: 10px 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font: inherit;
+  resize: vertical;
+}
+
+textarea:focus {
+  outline: 2px solid #0969da;
+  outline-offset: 1px;
+  border-color: #0969da;
+}
+
+button {
+  margin-top: 12px;
+  padding: 8px 18px;
+  border: none;
+  border-radius: 6px;
+  background: #0969da;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #0757b8;
+}
+
+button:focus-visible {
+  outline: 2px solid #0550ae;
+  outline-offset: 2px;
+}
+
+.error {
+  padding: 12px 14px;
+  margin-bottom: 20px;
+  border: 1px solid #cf222e;
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: #ffebe9;
+  color: #82071e;
+}
+
+.answer,
+.sources {
+  padding: 16px;
+  margin-bottom: 20px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.answer-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.sources ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.sources li {
+  word-break: break-all;
+}
+
+@media (max-width: 480px) {
+  body {
+    padding: 16px 12px;
+  }
+}

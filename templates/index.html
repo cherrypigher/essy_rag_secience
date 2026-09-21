@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>科研论文问答</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="container">
+    <h1>科研论文问答</h1>
+    <p class="hint">回答基于本地论文的 Top-3 检索片段，引用论文名来自索引元数据，仅供参考。</p>
+
+    <form method="post" action="{{ url_for('ask') }}">
+      <label for="question">问题</label>
+      <textarea id="question" name="question" rows="4" placeholder="例如：这些论文主要研究了什么问题？">{{ question }}</textarea>
+      <button type="submit">提交问题</button>
+    </form>
+
+    {% if error %}
+    <section class="error" role="alert">{{ error }}</section>
+    {% endif %}
+
+    {% if answer %}
+    <section class="answer">
+      <h2>回答</h2>
+      <p class="answer-body">{{ answer }}</p>
+    </section>
+    {% endif %}
+
+    {% if sources %}
+    <section class="sources">
+      <h2>引用论文</h2>
+      <ul>
+        {% for source in sources %}
+        <li>{{ source }}</li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+  </main>
+</body>
+</html>
